@@ -194,6 +194,183 @@ function openBrowser(url) {
   }
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+export function renderAuthCallbackPage({
+  status = "success",
+  title = "Authorization complete",
+  heading = "Authorization complete",
+  message = "You can close this tab and return to the terminal.",
+  detail = "Claude Codex Proxy is ready to save your ChatGPT OAuth session locally.",
+} = {}) {
+  const success = status === "success";
+  const safeTitle = escapeHtml(title);
+  const safeHeading = escapeHtml(heading);
+  const safeMessage = escapeHtml(message);
+  const safeDetail = escapeHtml(detail);
+  const accent = success ? "#0f766e" : "#b42318";
+  const accentSoft = success ? "#ccfbf1" : "#fee4e2";
+  const accentDark = success ? "#134e4a" : "#7a271a";
+  const icon = success ? "OK" : "!";
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${safeTitle}</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #647084;
+      --line: #d9e0ea;
+      --accent: ${accent};
+      --accent-soft: ${accentSoft};
+      --accent-dark: ${accentDark};
+      --shadow: 0 24px 80px rgba(28, 39, 54, 0.14);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      min-height: 100%;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background:
+        linear-gradient(180deg, #eef3f8 0%, #f6f8fb 46%, #ffffff 100%);
+      color: var(--text);
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(520px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .bar {
+      height: 6px;
+      background: var(--accent);
+    }
+    .content {
+      padding: 32px;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--accent-dark);
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .mark {
+      width: 34px;
+      height: 34px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent-dark);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+    h1 {
+      margin: 22px 0 10px;
+      font-size: clamp(28px, 5vw, 40px);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.6;
+    }
+    .detail {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid var(--line);
+      font-size: 14px;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 26px;
+    }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 8px;
+      padding: 11px 16px;
+      background: var(--accent);
+      color: white;
+      font: inherit;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(0.96); }
+    .secondary {
+      border: 1px solid var(--line);
+      background: #ffffff;
+      color: var(--text);
+    }
+    footer {
+      padding: 14px 32px;
+      border-top: 1px solid var(--line);
+      background: #f9fbfd;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    @media (max-width: 480px) {
+      body { padding: 14px; }
+      .content { padding: 26px 22px; }
+      footer { padding: 14px 22px; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="bar"></div>
+    <section class="content">
+      <div class="status"><span class="mark">${icon}</span>${success ? "Authorized" : "Action needed"}</div>
+      <h1>${safeHeading}</h1>
+      <p>${safeMessage}</p>
+      <p class="detail">${safeDetail}</p>
+      <div class="actions">
+        <button type="button" onclick="window.close()">Close tab</button>
+        <button type="button" class="secondary" onclick="location.href='about:blank'">Clear page</button>
+      </div>
+    </section>
+    <footer>Local callback: <code>${escapeHtml(REDIRECT_URI)}</code></footer>
+  </main>
+</body>
+</html>`;
+}
+
 function startCallbackServer(expectedState) {
   const server = http.createServer();
 
@@ -214,26 +391,42 @@ function startCallbackServer(expectedState) {
       const state = url.searchParams.get("state");
       const code = url.searchParams.get("code");
       if (state !== expectedState) {
-        res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
-        res.end("State mismatch. You can close this tab.");
+        res.writeHead(400, { "content-type": "text/html; charset=utf-8" });
+        res.end(renderAuthCallbackPage({
+          status: "error",
+          title: "State mismatch",
+          heading: "Authorization was not accepted",
+          message: "The OAuth state did not match the login session.",
+          detail: "Close this tab and run npm run auth again from the terminal.",
+        }));
         resolveCode(null);
         return;
       }
       if (!code) {
-        res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
-        res.end("Missing authorization code. You can close this tab.");
+        res.writeHead(400, { "content-type": "text/html; charset=utf-8" });
+        res.end(renderAuthCallbackPage({
+          status: "error",
+          title: "Missing authorization code",
+          heading: "No authorization code received",
+          message: "OpenAI redirected back without the code required to finish login.",
+          detail: "Close this tab and run npm run auth again from the terminal.",
+        }));
         resolveCode(null);
         return;
       }
 
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-      res.end(
-        "<!doctype html><title>Authorized</title><h1>Authorization complete</h1><p>You can close this tab and return to the terminal.</p>",
-      );
+      res.end(renderAuthCallbackPage());
       resolveCode(code);
     } catch {
-      res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-      res.end("Internal error");
+      res.writeHead(500, { "content-type": "text/html; charset=utf-8" });
+      res.end(renderAuthCallbackPage({
+        status: "error",
+        title: "Callback error",
+        heading: "Callback failed",
+        message: "The local callback server hit an internal error.",
+        detail: "Return to the terminal. The CLI will fall back to manual paste if needed.",
+      }));
       resolveCode(null);
     }
   });
