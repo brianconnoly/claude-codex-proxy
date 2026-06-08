@@ -509,7 +509,8 @@ export function trimAnthropicContext(body, maxInputTokens, options = {}) {
   if (!Number.isFinite(maxInputTokens) || maxInputTokens < 1) {
     throw new AnthropicError(500, "api_error", "Invalid context trim budget");
   }
-  if (originalTokens <= maxInputTokens) {
+  const forceRemoveOldest = Boolean(options.forceRemoveOldest);
+  if (originalTokens <= maxInputTokens && !forceRemoveOldest) {
     return {
       body,
       originalTokens,
@@ -533,6 +534,13 @@ export function trimAnthropicContext(body, maxInputTokens, options = {}) {
   const messages = body.messages.slice();
   let removedMessages = 0;
   let inputTokens = originalTokens;
+
+  if (forceRemoveOldest && messages.length > 1) {
+    messages.shift();
+    removedMessages += 1;
+    removedMessages += dropUnsafeLeadingMessages(messages);
+    inputTokens = estimateAnthropicTokens({ ...body, messages }, options);
+  }
 
   while (messages.length > 1 && inputTokens > maxInputTokens) {
     messages.shift();

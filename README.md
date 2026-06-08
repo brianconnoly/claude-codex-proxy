@@ -118,11 +118,12 @@ zip -r anthropic-proxy-plugin.zip anthropic-proxy
 - `CLAUDE_OPUS_REASONING_EFFORT`, `CLAUDE_SONNET_REASONING_EFFORT`, `CLAUDE_HAIKU_REASONING_EFFORT`: per-family reasoning profile for Codex mode.
 - `CLAUDE_OPUS_TEXT_VERBOSITY`, `CLAUDE_SONNET_TEXT_VERBOSITY`, `CLAUDE_HAIKU_TEXT_VERBOSITY`: per-family output verbosity profile for Codex mode.
 - `CODEX_CONTEXT_WINDOW_TOKENS`: raw upstream context window. Default: `400000`.
-- `CODEX_CONTEXT_RESERVE_TOKENS`: hard reserve kept for output, instructions, and token-estimation drift. Default: `8192`.
-- `CODEX_MAX_INPUT_TOKENS`: soft input context budget advertised in `/v1/models` so clients compact early. Default: `367232`.
-- `CODEX_HARD_INPUT_TOKENS`: hard input budget before proxy-side trimming or error. Default: `391808`.
+- `CODEX_CONTEXT_RESERVE_TOKENS`: hard reserve kept for output, instructions, hidden upstream overhead, and token-estimation drift. Default: `40000`.
+- `CODEX_MAX_INPUT_TOKENS`: soft input context budget advertised in `/v1/models` so clients compact early. Default: `320000`.
+- `CODEX_HARD_INPUT_TOKENS`: hard input budget before proxy-side trimming or error. Default: `360000`.
+- `CODEX_RETRY_INPUT_TOKENS`: aggressive retry budget used after the upstream rejects a request as too large. Default: `280000`.
 - `CLAUDE_OPUS_MAX_OUTPUT_TOKENS`, `CLAUDE_SONNET_MAX_OUTPUT_TOKENS`, `CLAUDE_HAIKU_MAX_OUTPUT_TOKENS`: advertised max output tokens per family. In `UPSTREAM=openai` mode the proxy sends a hard Responses API limit; in `UPSTREAM=codex` mode the ChatGPT-backed Codex endpoint rejects that parameter, so the proxy applies it as an instruction-level output budget. Defaults: `8192`, `8192`, `4096`.
-- `TOKEN_ESTIMATE_MULTIPLIER`: safety multiplier for local `/count_tokens` estimates. Default: `1.15`.
+- `TOKEN_ESTIMATE_MULTIPLIER`: safety multiplier for local `/count_tokens` estimates. Default: `1.3`.
 - `IMAGE_TOKEN_ESTIMATE`: local token estimate for image blocks when dimensions are unknown. Default: `1024`.
 - `CONTEXT_OVERFLOW_STRATEGY`: `trim` removes oldest messages before hard overflow; `error` returns a 400. Default: `trim`.
 - `CONTEXT_TRIM_NOTICE`: whether to add an instruction note when old messages were trimmed. Default: `true`.

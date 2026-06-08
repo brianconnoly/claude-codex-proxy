@@ -65,6 +65,11 @@ function isAuthorized(req) {
 }
 
 async function upstreamErrorToAnthropic(response) {
+  const error = await readUpstreamError(response);
+  return new AnthropicError(error.status, "api_error", error.message);
+}
+
+async function readUpstreamError(response) {
   const text = await response.text().catch(() => "");
   let message = text || response.statusText || "Upstream request failed";
   try {
@@ -77,24 +82,69 @@ async function upstreamErrorToAnthropic(response) {
   } catch {
     // Keep raw text.
   }
-  return new AnthropicError(response.status, "api_error", message);
+  return { status: response.status, message, body: text };
+}
+
+function upstreamErrorToAnthropicError(error) {
+  return new AnthropicError(error.status ?? 500, "api_error", error.message);
+}
+
+function isContextWindowError(message) {
+  return /context window|input exceeds|exceeds the context|too many tokens|context length|maximum context/i.test(
+    String(message ?? ""),
+  );
 }
 
 function estimateRequestInputTokens(body) {
   return estimateAnthropicTokens(body, config.tokenEstimate);
 }
 
-function contextTrimNotice(result) {
+function contextTrimNotice(result, reason = "the request exceeded the upstream context budget") {
   return (
     `Context note: the local gateway removed ${result.removedMessages} older ` +
-    `message(s) because the request exceeded the upstream context budget. ` +
+    `message(s) because ${reason}. ` +
     `Continue using the remaining conversation context and ask the user for missing details when needed.`
   );
 }
 
-function prepareContextBody(body) {
+function prepareContextBody(body, options = {}) {
   const inputTokens = estimateRequestInputTokens(body);
+  const targetInputTokens = options.targetInputTokens ?? config.limits.maxInputTokens;
   const hardInputTokens = config.limits.hardInputTokens;
+  const shouldTrim =
+    config.contextOverflow.strategy === "trim" &&
+    Array.isArray(body?.messages) &&
+    (inputTokens > targetInputTokens || options.forceTrim);
+
+  if (!shouldTrim && inputTokens <= hardInputTokens) {
+    return {
+      body,
+      inputTokens,
+      originalTokens: inputTokens,
+      instructionsSuffix: "",
+      trimmed: false,
+    };
+  }
+
+  if (shouldTrim) {
+    const trimmed = trimAnthropicContext(body, targetInputTokens, {
+      ...config.tokenEstimate,
+      forceRemoveOldest: Boolean(options.forceTrim),
+    });
+    if (!trimmed.exceeded) {
+      return {
+        body: trimmed.body,
+        inputTokens: trimmed.inputTokens,
+        originalTokens: trimmed.originalTokens,
+        instructionsSuffix: config.contextOverflow.trimNotice
+          ? contextTrimNotice(trimmed, options.reason)
+          : "",
+        trimmed: trimmed.trimmed,
+        removedMessages: trimmed.removedMessages,
+      };
+    }
+  }
+
   if (inputTokens <= hardInputTokens) {
     return {
       body,
@@ -105,22 +155,6 @@ function prepareContextBody(body) {
     };
   }
 
-  if (config.contextOverflow.strategy === "trim" && Array.isArray(body?.messages)) {
-    const trimmed = trimAnthropicContext(body, hardInputTokens, config.tokenEstimate);
-    if (!trimmed.exceeded) {
-      return {
-        body: trimmed.body,
-        inputTokens: trimmed.inputTokens,
-        originalTokens: trimmed.originalTokens,
-        instructionsSuffix: config.contextOverflow.trimNotice
-          ? contextTrimNotice(trimmed)
-          : "",
-        trimmed: trimmed.trimmed,
-        removedMessages: trimmed.removedMessages,
-      };
-    }
-  }
-
   throw new AnthropicError(
     400,
     "invalid_request_error",
@@ -129,18 +163,38 @@ function prepareContextBody(body) {
   );
 }
 
+async function callPreparedUpstream(body, prepareOptions = {}) {
+  const prepared = prepareContextBody(body, prepareOptions);
+  const upstreamBody = anthropicToResponses(prepared.body, config, {
+    forceStream: config.upstream === "codex",
+    instructionsSuffix: prepared.instructionsSuffix,
+  });
+  const upstream = await callUpstream(config, upstreamBody);
+  return { prepared, upstreamBody, upstream };
+}
+
 async function handleMessages(req, res) {
   if (!isAuthorized(req)) {
     throw new AnthropicError(401, "authentication_error", "Invalid proxy API key");
   }
 
   const body = await readJson(req);
-  const prepared = prepareContextBody(body);
-  const upstreamBody = anthropicToResponses(prepared.body, config, {
-    forceStream: config.upstream === "codex",
-    instructionsSuffix: prepared.instructionsSuffix,
-  });
-  const upstream = await callUpstream(config, upstreamBody);
+  let { upstreamBody, upstream } = await callPreparedUpstream(body);
+  let retriedContext = false;
+
+  if (!upstream.ok) {
+    const error = await readUpstreamError(upstream);
+    if (isContextWindowError(error.message) && config.contextOverflow.strategy === "trim") {
+      retriedContext = true;
+      ({ upstreamBody, upstream } = await callPreparedUpstream(body, {
+        targetInputTokens: config.limits.retryInputTokens,
+        forceTrim: true,
+        reason: "the upstream rejected the first attempt as too large for its context window",
+      }));
+    } else {
+      throw upstreamErrorToAnthropicError(error);
+    }
+  }
 
   if (!upstream.ok) {
     throw await upstreamErrorToAnthropic(upstream);
@@ -152,9 +206,33 @@ async function handleMessages(req, res) {
   }
 
   const contentType = upstream.headers.get("content-type") ?? "";
-  const responsesBody = upstreamBody.stream || contentType.includes("text/event-stream")
-    ? await parseResponsesSse(upstream)
-    : await upstream.json();
+  let responsesBody;
+  try {
+    responsesBody = upstreamBody.stream || contentType.includes("text/event-stream")
+      ? await parseResponsesSse(upstream)
+      : await upstream.json();
+  } catch (error) {
+    if (
+      !body.stream &&
+      !retriedContext &&
+      isContextWindowError(error.message) &&
+      config.contextOverflow.strategy === "trim"
+    ) {
+      retriedContext = true;
+      ({ upstreamBody, upstream } = await callPreparedUpstream(body, {
+        targetInputTokens: config.limits.retryInputTokens,
+        forceTrim: true,
+        reason: "the upstream rejected the first attempt as too large for its context window",
+      }));
+      if (!upstream.ok) throw await upstreamErrorToAnthropic(upstream);
+      const retryContentType = upstream.headers.get("content-type") ?? "";
+      responsesBody = upstreamBody.stream || retryContentType.includes("text/event-stream")
+        ? await parseResponsesSse(upstream)
+        : await upstream.json();
+    } else {
+      throw error;
+    }
+  }
 
   sendJson(res, 200, responsesToAnthropic(responsesBody, body.model ?? upstreamBody.model), {
     "request-id": crypto.randomUUID(),

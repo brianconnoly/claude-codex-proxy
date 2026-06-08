@@ -371,3 +371,26 @@ test("context trimming does not leave a leading orphan tool_result", () => {
     { role: "user", content: "final question" },
   ]);
 });
+
+test("forced context trimming removes old history even under target budget", () => {
+  const body = {
+    model: "sonnet",
+    messages: [
+      { role: "user", content: "old question" },
+      { role: "assistant", content: "old answer" },
+      { role: "user", content: "current question" },
+    ],
+  };
+  const original = estimateAnthropicTokens(body, { multiplier: 1 });
+  const result = trimAnthropicContext(body, original + 100, {
+    multiplier: 1,
+    forceRemoveOldest: true,
+  });
+
+  assert.equal(result.trimmed, true);
+  assert.equal(result.exceeded, false);
+  assert.equal(result.removedMessages, 2);
+  assert.deepEqual(result.body.messages, [
+    { role: "user", content: "current question" },
+  ]);
+});

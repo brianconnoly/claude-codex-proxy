@@ -182,16 +182,18 @@ Discovery показывает только короткие aliases, но proxy
 | Параметр | Значение |
 | --- | --- |
 | Raw context window | `400000` |
-| Advertised input budget for Claude Desktop | `367232` |
-| Hard input budget before trimming/error | `391808` |
-| Hard reserve | `8192` |
+| Advertised input budget for Claude Desktop | `320000` |
+| Hard input budget before trimming/error | `360000` |
+| Retry input budget after upstream context error | `280000` |
+| Hard reserve | `40000` |
 | Output budget Opus/Sonnet | `8192` |
 | Output budget Haiku | `4096` |
 
-Есть два разных входных лимита:
+Есть три разных входных лимита:
 
 - `CODEX_MAX_INPUT_TOKENS` - soft/advertised budget. Его видит Claude Desktop в `/v1/models`, чтобы заранее запускать compaction.
 - `CODEX_HARD_INPUT_TOKENS` - hard budget proxy перед отправкой в upstream. Он ближе к реальному окну `400000` и защищает от настоящего overflow.
+- `CODEX_RETRY_INPUT_TOKENS` - более агрессивный budget для автоматического повторного запроса, если upstream все равно ответил `context window exceeded`.
 
 `/v1/messages/count_tokens` считает локальную приблизительную оценку. Она специально консервативна для русского/non-ASCII текста, tool schemas, tool results и image blocks. Это нужно, чтобы Claude Desktop начинал compaction раньше.
 
@@ -203,6 +205,8 @@ Discovery показывает только короткие aliases, но proxy
 - история не начинается с orphan `tool_result`;
 - в upstream `instructions` добавляется короткая заметка, что старые сообщения были удалены;
 - модель может потерять ранние детали, но чат не обрывается.
+
+Если upstream уже после отправки отвечает ошибкой вида `Your input exceeds the context window of this model`, proxy делает один автоматический retry: берет исходный запрос, обрезает старую историю до `CODEX_RETRY_INPUT_TOKENS` и отправляет заново. Это нужно потому, что ChatGPT-backed Codex endpoint имеет скрытый overhead, который нельзя точно посчитать локально.
 
 Если даже после trimming запрос не помещается, proxy вернет:
 
@@ -298,9 +302,10 @@ curl -N http://127.0.0.1:8787/v1/messages \
 | `CLAUDE_*_REASONING_EFFORT` | reasoning effort по семействам |
 | `CLAUDE_*_TEXT_VERBOSITY` | verbosity по семействам |
 | `CODEX_CONTEXT_WINDOW_TOKENS` | raw upstream context window |
-| `CODEX_CONTEXT_RESERVE_TOKENS` | hard reserve под output и погрешность |
+| `CODEX_CONTEXT_RESERVE_TOKENS` | hard reserve под output, hidden overhead и погрешность |
 | `CODEX_MAX_INPUT_TOKENS` | soft/advertised input budget для клиента |
 | `CODEX_HARD_INPUT_TOKENS` | hard budget перед trimming/error |
+| `CODEX_RETRY_INPUT_TOKENS` | aggressive retry budget после upstream context error |
 | `CLAUDE_*_MAX_OUTPUT_TOKENS` | advertised output budget |
 | `TOKEN_ESTIMATE_MULTIPLIER` | safety multiplier для count_tokens |
 | `IMAGE_TOKEN_ESTIMATE` | оценка image block без размеров |
@@ -365,18 +370,21 @@ curl -s http://127.0.0.1:8787/v1/models/haiku
 - upstream отказал из-за контекста или quota
 - streaming error был скрыт старой версией proxy
 
-Проверьте, что `/v1/models` показывает `max_input_tokens: 367232`, а не `400000`. Если все еще `400000`, работает старый процесс.
+Проверьте, что `/v1/models` показывает `max_input_tokens: 320000`, а не `400000` или `367232`. Если значение старое, работает старый процесс.
 
 ### `Context window exceeded`
 
-Это hard guard proxy. Сначала убедитесь, что сервер перезапущен и в `.env` есть:
+Это hard guard proxy. Сначала убедитесь, что сервер перезапущен и в `.env` есть актуальные более безопасные значения:
 
 ```dotenv
-CODEX_HARD_INPUT_TOKENS=391808
+CODEX_MAX_INPUT_TOKENS=320000
+CODEX_HARD_INPUT_TOKENS=360000
+CODEX_RETRY_INPUT_TOKENS=280000
+TOKEN_ESTIMATE_MULTIPLIER=1.3
 CONTEXT_OVERFLOW_STRATEGY=trim
 ```
 
-Если ошибка остается, значит последний запрос слишком большой даже после удаления старой истории. Начните новый чат или попросите Claude Desktop/клиент сжать историю.
+Если ошибка остается после перезапуска, значит последний запрос слишком большой даже после удаления старой истории или upstream отклоняет модель с меньшим фактическим окном. Временно уменьшите `CODEX_MAX_INPUT_TOKENS` и `CODEX_RETRY_INPUT_TOKENS`, затем перезапустите proxy.
 
 ### OAuth истек или upstream отвечает 401/403
 

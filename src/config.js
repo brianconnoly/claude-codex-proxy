@@ -186,11 +186,12 @@ export function loadConfig() {
     "CODEX_CONTEXT_WINDOW_TOKENS",
   );
   const contextReserveTokens = parseNonNegativeInteger(
-    env("CODEX_CONTEXT_RESERVE_TOKENS", "8192"),
+    env("CODEX_CONTEXT_RESERVE_TOKENS", "40000"),
     "CODEX_CONTEXT_RESERVE_TOKENS",
   );
   const defaultHardInputTokens = Math.max(1, contextWindowTokens - contextReserveTokens);
-  const defaultMaxInputTokens = Math.max(1, contextWindowTokens - 32768);
+  const defaultMaxInputTokens = Math.max(1, contextWindowTokens - 80000);
+  const defaultRetryInputTokens = Math.max(1, contextWindowTokens - 120000);
   const contextOverflowStrategy = env("CONTEXT_OVERFLOW_STRATEGY", "trim").toLowerCase();
   if (contextOverflowStrategy !== "trim" && contextOverflowStrategy !== "error") {
     throw new Error("CONTEXT_OVERFLOW_STRATEGY must be either trim or error");
@@ -221,6 +222,10 @@ export function loadConfig() {
       hardInputTokens: parsePositiveInteger(
         env("CODEX_HARD_INPUT_TOKENS", String(defaultHardInputTokens)),
         "CODEX_HARD_INPUT_TOKENS",
+      ),
+      retryInputTokens: parsePositiveInteger(
+        env("CODEX_RETRY_INPUT_TOKENS", String(defaultRetryInputTokens)),
+        "CODEX_RETRY_INPUT_TOKENS",
       ),
       opusMaxOutputTokens: parsePositiveInteger(
         env("CLAUDE_OPUS_MAX_OUTPUT_TOKENS", "8192"),
@@ -272,7 +277,7 @@ export function loadConfig() {
       textVerbosity: env("TEXT_VERBOSITY", "low"),
     },
     tokenEstimate: {
-      multiplier: parsePositiveNumber(env("TOKEN_ESTIMATE_MULTIPLIER", "1.15"), "TOKEN_ESTIMATE_MULTIPLIER"),
+      multiplier: parsePositiveNumber(env("TOKEN_ESTIMATE_MULTIPLIER", "1.3"), "TOKEN_ESTIMATE_MULTIPLIER"),
       imageTokens: parsePositiveInteger(env("IMAGE_TOKEN_ESTIMATE", "1024"), "IMAGE_TOKEN_ESTIMATE"),
     },
     contextOverflow: {
