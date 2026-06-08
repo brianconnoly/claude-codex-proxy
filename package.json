@@ -1,0 +1,16 @@
+{
+  "name": "anthropic-codex-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Anthropic Messages API proxy for OpenAI Responses/Codex-compatible upstreams.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "auth": "node src/auth-cli.js",
+    "check": "node --check src/*.js test/*.test.js claude-plugin/anthropic-proxy/mcp/*.js",
+    "test": "node --test"
+  }
+}

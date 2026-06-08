@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "anthropic-proxy": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/server.js"
+      ],
+      "env": {
+        "ANTHROPIC_PROXY_URL": "http://127.0.0.1:8787"
+      }
+    }
+  }
+}
