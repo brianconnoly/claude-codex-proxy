@@ -189,13 +189,20 @@ export function loadConfig() {
     env("CODEX_CONTEXT_RESERVE_TOKENS", "40000"),
     "CODEX_CONTEXT_RESERVE_TOKENS",
   );
-  const defaultHardInputTokens = Math.max(1, contextWindowTokens - contextReserveTokens);
-  const defaultMaxInputTokens = Math.max(1, contextWindowTokens - 80000);
-  const defaultRetryInputTokens = Math.max(1, contextWindowTokens - 120000);
+  const defaultHardInputTokens = Math.max(
+    1,
+    contextWindowTokens - Math.max(contextReserveTokens, 40000),
+  );
+  const defaultMaxInputTokens = Math.max(1, contextWindowTokens - 60000);
+  const defaultRetryInputTokens = Math.max(1, contextWindowTokens - 100000);
   const contextOverflowStrategy = env("CONTEXT_OVERFLOW_STRATEGY", "trim").toLowerCase();
   if (contextOverflowStrategy !== "trim" && contextOverflowStrategy !== "error") {
     throw new Error("CONTEXT_OVERFLOW_STRATEGY must be either trim or error");
   }
+  const compactEnabled = parseBoolean(
+    env("CONTEXT_COMPACT_ENABLED", "true"),
+    "CONTEXT_COMPACT_ENABLED",
+  );
 
   return {
     projectRoot,
@@ -283,6 +290,25 @@ export function loadConfig() {
     contextOverflow: {
       strategy: contextOverflowStrategy,
       trimNotice: parseBoolean(env("CONTEXT_TRIM_NOTICE", "true"), "CONTEXT_TRIM_NOTICE"),
+    },
+    contextCompact: {
+      enabled: compactEnabled,
+      model: env("CONTEXT_COMPACT_MODEL", env("CLAUDE_HAIKU_MODEL", "gpt-5.4-mini")),
+      reasoningEffort: env("CONTEXT_COMPACT_REASONING_EFFORT", "low"),
+      reasoningSummary: env("CONTEXT_COMPACT_REASONING_SUMMARY", "auto"),
+      textVerbosity: env("CONTEXT_COMPACT_TEXT_VERBOSITY", "low"),
+      maxOutputTokens: parsePositiveInteger(
+        env("CONTEXT_COMPACT_MAX_OUTPUT_TOKENS", "2048"),
+        "CONTEXT_COMPACT_MAX_OUTPUT_TOKENS",
+      ),
+      summaryTokenBudget: parsePositiveInteger(
+        env("CONTEXT_COMPACT_SUMMARY_TOKENS", "2048"),
+        "CONTEXT_COMPACT_SUMMARY_TOKENS",
+      ),
+      cacheSize: parseNonNegativeInteger(
+        env("CONTEXT_COMPACT_CACHE_SIZE", "64"),
+        "CONTEXT_COMPACT_CACHE_SIZE",
+      ),
     },
   };
 }

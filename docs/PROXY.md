@@ -100,6 +100,8 @@ npm start
 
 Если в `.env` задан `PROXY_API_KEY`, то в Claude Desktop нужно указать именно это значение. Proxy принимает его как `x-api-key` или `Authorization: Bearer`.
 
+Для Codex-backed контекста не задавайте `supports1m: true` и не отключайте model discovery. `Test model discovery` должен успешно ходить в `/v1/models`, но GUI Claude Desktop может все равно показывать стандартное Claude-like окно `200k`. Это UI-level bucket в Cowork/Claude Desktop; надежная проверка proxy-лимита - прямой запрос к `/v1/models`, где должно быть `max_input_tokens: 340000`.
+
 7. Нажмите `Apply locally` / `Save`.
 8. Полностью перезапустите Claude Desktop.
 
@@ -182,10 +184,12 @@ Discovery показывает только короткие aliases, но proxy
 | Параметр | Значение |
 | --- | --- |
 | Raw context window | `400000` |
-| Advertised input budget for Claude Desktop | `320000` |
+| Advertised input budget for Claude Desktop | `340000` |
 | Hard input budget before trimming/error | `360000` |
-| Retry input budget after upstream context error | `280000` |
+| Retry input budget after upstream context error | `300000` |
 | Hard reserve | `40000` |
+| Proxy compact model | `gpt-5.4-mini` |
+| Proxy compact summary budget | `2048` |
 | Output budget Opus/Sonnet | `8192` |
 | Output budget Haiku | `4096` |
 
@@ -197,16 +201,20 @@ Discovery показывает только короткие aliases, но proxy
 
 `/v1/messages/count_tokens` считает локальную приблизительную оценку. Она специально консервативна для русского/non-ASCII текста, tool schemas, tool results и image blocks. Это нужно, чтобы Claude Desktop начинал compaction раньше.
 
-Если Claude Desktop все равно отправил историю выше soft budget, proxy теперь не отвечает 400 сразу. Он принимает запрос до `CODEX_HARD_INPUT_TOKENS`.
+Важно: Claude Desktop может показывать `200k` в интерфейсе даже когда gateway discovery возвращает `max_input_tokens: 340000`. По публичной конфигурации Cowork on 3P есть обычная Claude-like модель и отдельный `supports1m` вариант, но нет документированного способа выставить произвольное GUI-окно вроде `340k`. Поэтому native compaction может сработать около `200k`; если Desktop все равно отправит больше, proxy-side compaction остается fallback.
 
-Если запрос превышает hard budget и `CONTEXT_OVERFLOW_STRATEGY=trim`, proxy удаляет самые старые сообщения, пока запрос не станет помещаться. При trimming:
+Если Claude Desktop все равно отправил историю выше soft budget, proxy теперь не отвечает 400 сразу. Сначала он пытается сжать старый префикс истории отдельным дешевым запросом в `CONTEXT_COMPACT_MODEL` (`gpt-5.4-mini` по умолчанию), вставляет summary первым synthetic user message и сохраняет свежий хвост истории как raw messages.
+
+Claude Desktop этот compact не видит как native compaction: на следующем turn он снова пришлет свою локальную историю. Поэтому proxy кеширует summaries in-memory по fingerprint сжатого префикса (`CONTEXT_COMPACT_CACHE_SIZE`), чтобы не пересжимать один и тот же старый блок каждый раз.
+
+Если compact не помог или summary-запрос не удался, а `CONTEXT_OVERFLOW_STRATEGY=trim`, proxy возвращается к аварийному raw trimming и удаляет самые старые сообщения, пока запрос не станет помещаться. При trimming/compaction:
 
 - сохраняется последний пользовательский контекст;
 - история не начинается с orphan `tool_result`;
-- в upstream `instructions` добавляется короткая заметка, что старые сообщения были удалены;
-- модель может потерять ранние детали, но чат не обрывается.
+- в upstream `instructions` добавляется короткая заметка, что старые сообщения были сжаты или удалены;
+- при successful compact модель получает summary ранних деталей, но Claude Desktop не обновляет свою локальную историю.
 
-Если upstream уже после отправки отвечает ошибкой вида `Your input exceeds the context window of this model`, proxy делает один автоматический retry: берет исходный запрос, обрезает старую историю до `CODEX_RETRY_INPUT_TOKENS` и отправляет заново. Это нужно потому, что ChatGPT-backed Codex endpoint имеет скрытый overhead, который нельзя точно посчитать локально.
+Если upstream уже после отправки отвечает ошибкой вида `Your input exceeds the context window of this model`, proxy делает один автоматический retry: берет исходный запрос, пытается compact до `CODEX_RETRY_INPUT_TOKENS`, а если compact не удался - делает raw trim и отправляет заново. Это нужно потому, что ChatGPT-backed Codex endpoint имеет скрытый overhead, который нельзя точно посчитать локально.
 
 Если даже после trimming запрос не помещается, proxy вернет:
 
@@ -311,6 +319,11 @@ curl -N http://127.0.0.1:8787/v1/messages \
 | `IMAGE_TOKEN_ESTIMATE` | оценка image block без размеров |
 | `CONTEXT_OVERFLOW_STRATEGY` | `trim` или `error` |
 | `CONTEXT_TRIM_NOTICE` | добавлять notice в instructions после trimming |
+| `CONTEXT_COMPACT_ENABLED` | сжимать старый префикс перед raw trimming |
+| `CONTEXT_COMPACT_MODEL` | модель для proxy-side summary |
+| `CONTEXT_COMPACT_MAX_OUTPUT_TOKENS` | output budget summary-запроса |
+| `CONTEXT_COMPACT_SUMMARY_TOKENS` | reserved summary budget при выборе префикса |
+| `CONTEXT_COMPACT_CACHE_SIZE` | размер in-memory cache для summaries |
 | `MODEL_MAP` | exact overrides, например `claude-sonnet-4-6=gpt-5.4` |
 | `CODEX_AUTH_FILE` | путь к OAuth token file |
 | `CODEX_INSTRUCTIONS` | fallback instructions для Codex |
@@ -370,21 +383,25 @@ curl -s http://127.0.0.1:8787/v1/models/haiku
 - upstream отказал из-за контекста или quota
 - streaming error был скрыт старой версией proxy
 
-Проверьте, что `/v1/models` показывает `max_input_tokens: 320000`, а не `400000` или `367232`. Если значение старое, работает старый процесс.
+Проверьте, что `/v1/models` показывает `max_input_tokens: 340000`, а не `400000`, `367232`, `320000` или `250000`. Если значение старое, работает старый процесс.
 
 ### `Context window exceeded`
 
 Это hard guard proxy. Сначала убедитесь, что сервер перезапущен и в `.env` есть актуальные более безопасные значения:
 
 ```dotenv
-CODEX_MAX_INPUT_TOKENS=320000
+CODEX_MAX_INPUT_TOKENS=340000
 CODEX_HARD_INPUT_TOKENS=360000
-CODEX_RETRY_INPUT_TOKENS=280000
+CODEX_RETRY_INPUT_TOKENS=300000
 TOKEN_ESTIMATE_MULTIPLIER=1.3
 CONTEXT_OVERFLOW_STRATEGY=trim
+CONTEXT_COMPACT_ENABLED=true
+CONTEXT_COMPACT_MODEL=gpt-5.4-mini
+CONTEXT_COMPACT_MAX_OUTPUT_TOKENS=2048
+CONTEXT_COMPACT_SUMMARY_TOKENS=2048
 ```
 
-Если ошибка остается после перезапуска, значит последний запрос слишком большой даже после удаления старой истории или upstream отклоняет модель с меньшим фактическим окном. Временно уменьшите `CODEX_MAX_INPUT_TOKENS` и `CODEX_RETRY_INPUT_TOKENS`, затем перезапустите proxy.
+Если ошибка остается после перезапуска, значит последний запрос слишком большой даже после compaction/trimming или upstream отклоняет модель с меньшим фактическим окном. Временно уменьшите `CODEX_MAX_INPUT_TOKENS` и `CODEX_RETRY_INPUT_TOKENS`, затем перезапустите proxy.
 
 ### OAuth истек или upstream отвечает 401/403
 

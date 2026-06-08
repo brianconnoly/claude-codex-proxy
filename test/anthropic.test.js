@@ -8,6 +8,11 @@ import {
   responsesToAnthropic,
   trimAnthropicContext,
 } from "../src/anthropic.js";
+import {
+  applyAnthropicCompactSummary,
+  renderMessagesForCompactSummary,
+  selectAnthropicCompactContext,
+} from "../src/context-compact.js";
 
 const config = {
   upstream: "codex",
@@ -393,4 +398,65 @@ test("forced context trimming removes old history even under target budget", () 
   assert.deepEqual(result.body.messages, [
     { role: "user", content: "current question" },
   ]);
+});
+
+test("selects old Anthropic messages for summary compaction", () => {
+  const body = {
+    model: "sonnet",
+    messages: [
+      { role: "user", content: "я".repeat(200) },
+      { role: "assistant", content: "old answer" },
+      { role: "user", content: "current question" },
+    ],
+  };
+
+  const selection = selectAnthropicCompactContext(body, 80, {
+    multiplier: 1,
+    summaryPlaceholder: "short summary",
+  });
+  const result = applyAnthropicCompactSummary(
+    body,
+    selection,
+    "Earlier: the user asked an old question and received an old answer.",
+    120,
+    { multiplier: 1 },
+  );
+
+  assert.equal(selection.compacted, true);
+  assert.equal(selection.removedMessages, 2);
+  assert.equal(result.compacted, true);
+  assert.equal(result.body.messages[0].role, "user");
+  assert.match(result.body.messages[0].content[0].text, /Earlier conversation summary/);
+  assert.deepEqual(result.body.messages.slice(1), [
+    { role: "user", content: "current question" },
+  ]);
+});
+
+test("summary compaction does not leave a leading orphan tool_result", () => {
+  const body = {
+    model: "sonnet",
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_1", name: "read", input: { path: "a" } }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call_1", content: "old result" }],
+      },
+      { role: "user", content: "final question" },
+    ],
+  };
+
+  const selection = selectAnthropicCompactContext(body, 45, {
+    multiplier: 1,
+    summaryPlaceholder: "summary",
+  });
+
+  assert.equal(selection.compacted, true);
+  assert.equal(selection.removedMessages, 2);
+  assert.deepEqual(selection.tailMessages, [
+    { role: "user", content: "final question" },
+  ]);
+  assert.match(renderMessagesForCompactSummary(selection.compactedMessages), /tool_use: read/);
 });

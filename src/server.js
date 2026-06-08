@@ -11,10 +11,17 @@ import {
   responsesToAnthropic,
   trimAnthropicContext,
 } from "./anthropic.js";
+import {
+  applyAnthropicCompactSummary,
+  renderMessagesForCompactSummary,
+  selectAnthropicCompactContext,
+  truncateCompactSummary,
+} from "./context-compact.js";
 import { callUpstream } from "./upstream.js";
 import { encodeSse, parseResponsesSse, readSseEvents } from "./sse.js";
 
 const config = loadConfig();
+const compactSummaryCache = new Map();
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
@@ -107,7 +114,182 @@ function contextTrimNotice(result, reason = "the request exceeded the upstream c
   );
 }
 
-function prepareContextBody(body, options = {}) {
+function contextCompactNotice(result, reason = "the request exceeded the upstream context budget") {
+  return (
+    `Context note: the local gateway summarized ${result.removedMessages} older ` +
+    `message(s) because ${reason}. The first user message contains the summary of that earlier context. ` +
+    `Continue using the summary and the remaining raw conversation context.`
+  );
+}
+
+function compactSummaryCacheKey(body, compactedMessages) {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify({
+      model: config.contextCompact.model,
+      system: body?.system,
+      messages: compactedMessages,
+    }))
+    .digest("hex");
+}
+
+function getCachedCompactSummary(key) {
+  if (!config.contextCompact.cacheSize) return null;
+  const value = compactSummaryCache.get(key);
+  if (value == null) return null;
+  compactSummaryCache.delete(key);
+  compactSummaryCache.set(key, value);
+  return value;
+}
+
+function setCachedCompactSummary(key, value) {
+  if (!config.contextCompact.cacheSize) return;
+  compactSummaryCache.delete(key);
+  compactSummaryCache.set(key, value);
+  while (compactSummaryCache.size > config.contextCompact.cacheSize) {
+    const oldestKey = compactSummaryCache.keys().next().value;
+    compactSummaryCache.delete(oldestKey);
+  }
+}
+
+function compactInstructions() {
+  return [
+    "You are compacting an earlier prefix of a coding-assistant conversation for a local gateway.",
+    `Return a dense factual summary under about ${config.contextCompact.summaryTokenBudget} tokens.`,
+    "Preserve user goals, project constraints, decisions, exact file paths, commands, error messages, config values, model names, URLs, and pending work.",
+    "Preserve tool results only when they affect future work.",
+    "Omit greetings, filler, repeated confirmations, and details that are no longer actionable.",
+    "Return only the summary text. Do not answer the user's latest request.",
+  ].join("\n");
+}
+
+function compactPromptForMessages(messages) {
+  return [
+    "Summarize this earlier conversation prefix. The raw prefix will be removed from the next model request and replaced by your summary.",
+    "The later unsummarized conversation tail will be appended after this summary.",
+    "",
+    "<conversation_prefix>",
+    renderMessagesForCompactSummary(messages),
+    "</conversation_prefix>",
+  ].join("\n");
+}
+
+function compactResponsesBody(messages) {
+  const body = {
+    model: config.contextCompact.model,
+    input: [
+      {
+        role: "user",
+        content: [{ type: "input_text", text: compactPromptForMessages(messages) }],
+      },
+    ],
+    instructions: compactInstructions(),
+    stream: config.upstream === "codex",
+    store: false,
+  };
+
+  if (config.upstream === "codex") {
+    body.include = ["reasoning.encrypted_content"];
+    body.reasoning = {
+      effort: config.contextCompact.reasoningEffort,
+      summary: config.contextCompact.reasoningSummary,
+    };
+    body.text = {
+      verbosity: config.contextCompact.textVerbosity,
+    };
+    body.instructions += `\n\nOutput budget: stay within about ${config.contextCompact.maxOutputTokens} output tokens.`;
+  } else {
+    body.max_output_tokens = config.contextCompact.maxOutputTokens;
+  }
+
+  return body;
+}
+
+async function readResponsesPayload(response, upstreamBody) {
+  const contentType = response.headers.get("content-type") ?? "";
+  return upstreamBody.stream || contentType.includes("text/event-stream")
+    ? await parseResponsesSse(response)
+    : await response.json();
+}
+
+function textFromAnthropicContent(content) {
+  return (content ?? [])
+    .filter((part) => part?.type === "text")
+    .map((part) => part.text ?? "")
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+async function summarizeCompactedMessages(messages) {
+  const upstreamBody = compactResponsesBody(messages);
+  const upstream = await callUpstream(config, upstreamBody);
+  if (!upstream.ok) {
+    const error = await readUpstreamError(upstream);
+    throw upstreamErrorToAnthropicError(error);
+  }
+
+  const responsesBody = await readResponsesPayload(upstream, upstreamBody);
+  const anthropic = responsesToAnthropic(responsesBody, config.contextCompact.model);
+  const summary = textFromAnthropicContent(anthropic.content);
+  if (!summary) {
+    throw new AnthropicError(500, "api_error", "Compact summary response was empty");
+  }
+
+  return truncateCompactSummary(
+    summary,
+    Math.max(512, config.contextCompact.summaryTokenBudget * 4),
+  );
+}
+
+async function tryCompactContextBody(body, targetInputTokens, options = {}) {
+  if (!config.contextCompact.enabled || config.contextOverflow.strategy !== "trim") {
+    return null;
+  }
+  if (!Array.isArray(body?.messages) || body.messages.length <= 1) return null;
+
+  const selection = selectAnthropicCompactContext(body, targetInputTokens, {
+    ...config.tokenEstimate,
+    summaryTokenBudget: config.contextCompact.summaryTokenBudget,
+    forceCompactOldest: Boolean(options.forceTrim),
+  });
+  if (!selection.compacted) return null;
+
+  try {
+    const cacheKey = compactSummaryCacheKey(body, selection.compactedMessages);
+    let summary = getCachedCompactSummary(cacheKey);
+    if (!summary) {
+      summary = await summarizeCompactedMessages(selection.compactedMessages);
+      setCachedCompactSummary(cacheKey, summary);
+    }
+
+    const compacted = applyAnthropicCompactSummary(
+      body,
+      selection,
+      summary,
+      targetInputTokens,
+      config.tokenEstimate,
+    );
+    if (compacted.exceeded) return null;
+
+    return {
+      body: compacted.body,
+      inputTokens: compacted.inputTokens,
+      originalTokens: compacted.originalTokens,
+      instructionsSuffix: config.contextOverflow.trimNotice
+        ? contextCompactNotice(compacted, options.reason)
+        : "",
+      trimmed: false,
+      compacted: true,
+      removedMessages: compacted.removedMessages,
+    };
+  } catch (error) {
+    console.warn(`Context compact failed, falling back to trim: ${error.message}`);
+    return null;
+  }
+}
+
+async function prepareContextBody(body, options = {}) {
   const inputTokens = estimateRequestInputTokens(body);
   const targetInputTokens = options.targetInputTokens ?? config.limits.maxInputTokens;
   const hardInputTokens = config.limits.hardInputTokens;
@@ -124,6 +306,11 @@ function prepareContextBody(body, options = {}) {
       instructionsSuffix: "",
       trimmed: false,
     };
+  }
+
+  if (shouldTrim) {
+    const compacted = await tryCompactContextBody(body, targetInputTokens, options);
+    if (compacted) return compacted;
   }
 
   if (shouldTrim) {
@@ -164,7 +351,7 @@ function prepareContextBody(body, options = {}) {
 }
 
 async function callPreparedUpstream(body, prepareOptions = {}) {
-  const prepared = prepareContextBody(body, prepareOptions);
+  const prepared = await prepareContextBody(body, prepareOptions);
   const upstreamBody = anthropicToResponses(prepared.body, config, {
     forceStream: config.upstream === "codex",
     instructionsSuffix: prepared.instructionsSuffix,
