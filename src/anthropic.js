@@ -307,6 +307,13 @@ export function anthropicToResponses(body, config, options = {}) {
     );
   }
 
+  if (options.instructionsSuffix) {
+    upstreamBody.instructions = appendInstructions(
+      upstreamBody.instructions,
+      options.instructionsSuffix,
+    );
+  }
+
   return upstreamBody;
 }
 
@@ -472,6 +479,76 @@ export function estimateAnthropicTokens(body, options = {}) {
     ? options.multiplier
     : 1;
   return Math.max(0, Math.ceil(tokens * multiplier));
+}
+
+function contentHasToolResult(content) {
+  return asArray(content).some((part) => part?.type === "tool_result");
+}
+
+function dropUnsafeLeadingMessages(messages) {
+  let dropped = 0;
+  while (messages.length > 1) {
+    const first = messages[0];
+    if (first?.role === "assistant") {
+      messages.shift();
+      dropped += 1;
+      continue;
+    }
+    if (first?.role === "user" && contentHasToolResult(first.content)) {
+      messages.shift();
+      dropped += 1;
+      continue;
+    }
+    break;
+  }
+  return dropped;
+}
+
+export function trimAnthropicContext(body, maxInputTokens, options = {}) {
+  const originalTokens = estimateAnthropicTokens(body, options);
+  if (!Number.isFinite(maxInputTokens) || maxInputTokens < 1) {
+    throw new AnthropicError(500, "api_error", "Invalid context trim budget");
+  }
+  if (originalTokens <= maxInputTokens) {
+    return {
+      body,
+      originalTokens,
+      inputTokens: originalTokens,
+      removedMessages: 0,
+      trimmed: false,
+    };
+  }
+
+  if (!Array.isArray(body?.messages) || body.messages.length <= 1) {
+    return {
+      body,
+      originalTokens,
+      inputTokens: originalTokens,
+      removedMessages: 0,
+      trimmed: false,
+      exceeded: true,
+    };
+  }
+
+  const messages = body.messages.slice();
+  let removedMessages = 0;
+  let inputTokens = originalTokens;
+
+  while (messages.length > 1 && inputTokens > maxInputTokens) {
+    messages.shift();
+    removedMessages += 1;
+    removedMessages += dropUnsafeLeadingMessages(messages);
+    inputTokens = estimateAnthropicTokens({ ...body, messages }, options);
+  }
+
+  return {
+    body: { ...body, messages },
+    originalTokens,
+    inputTokens,
+    removedMessages,
+    trimmed: removedMessages > 0,
+    exceeded: inputTokens > maxInputTokens,
+  };
 }
 
 export function anthropicError(status, type, message) {

@@ -6,6 +6,7 @@ import {
   resolveAnthropicFamily,
   resolveModelProfile,
   responsesToAnthropic,
+  trimAnthropicContext,
 } from "../src/anthropic.js";
 
 const config = {
@@ -322,4 +323,51 @@ test("estimates non-ASCII conversations conservatively", () => {
   );
 
   assert.ok(russian > ascii * 2);
+});
+
+test("trims oldest Anthropic messages to fit a hard context budget", () => {
+  const body = {
+    model: "sonnet",
+    messages: [
+      { role: "user", content: "я".repeat(200) },
+      { role: "assistant", content: "old answer" },
+      { role: "user", content: "current question" },
+    ],
+  };
+
+  const original = estimateAnthropicTokens(body, { multiplier: 1 });
+  const result = trimAnthropicContext(body, 80, { multiplier: 1 });
+
+  assert.equal(result.trimmed, true);
+  assert.equal(result.exceeded, false);
+  assert.ok(result.originalTokens > original - 1);
+  assert.ok(result.inputTokens <= 80);
+  assert.deepEqual(result.body.messages, [
+    { role: "user", content: "current question" },
+  ]);
+});
+
+test("context trimming does not leave a leading orphan tool_result", () => {
+  const body = {
+    model: "sonnet",
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_1", name: "read", input: { path: "a" } }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call_1", content: "old result" }],
+      },
+      { role: "user", content: "final question" },
+    ],
+  };
+
+  const result = trimAnthropicContext(body, 40, { multiplier: 1 });
+
+  assert.equal(result.trimmed, true);
+  assert.equal(result.exceeded, false);
+  assert.deepEqual(result.body.messages, [
+    { role: "user", content: "final question" },
+  ]);
 });

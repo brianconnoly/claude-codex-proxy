@@ -59,18 +59,49 @@ haiku
 npm start
 ```
 
-В Claude Desktop настройте custom provider / gateway / Anthropic-compatible endpoint. Названия пунктов могут отличаться между версиями Claude Desktop, но значения должны быть такими:
+В Claude Desktop нужно включить Developer Mode и настроить third-party inference. Это именно настройка inference/API gateway; она не связана с MCP extensions или plugin skills.
+
+1. Откройте Claude Desktop, не web-версию `claude.ai`.
+2. В верхнем меню включите Developer Mode:
+
+   ```text
+   Help -> Troubleshooting -> Enable Developer Mode
+   ```
+
+   В некоторых сборках тот же вход доступен через:
+
+   ```text
+   Settings -> Developer
+   ```
+
+3. Полностью перезапустите Claude Desktop, если приложение попросит это сделать.
+4. Откройте появившееся меню:
+
+   ```text
+   Developer -> Configure third-party inference
+   ```
+
+5. В разделе connection/provider выберите:
+
+   ```text
+   Gateway (Anthropic-compatible)
+   ```
+
+6. Заполните значения:
 
 | Поле | Значение |
 | --- | --- |
-| API type / provider | Anthropic-compatible / Claude Messages API |
-| Base URL / Endpoint | `http://127.0.0.1:8787` |
-| API key | любое непустое значение, например `local` |
-| Model | `opus`, `sonnet` или `haiku` |
+| Gateway base URL / Base URL | `http://127.0.0.1:8787` |
+| API key | `local`, если `PROXY_API_KEY` пустой |
+| Auth scheme | `x-api-key` или `Bearer`, если UI просит выбрать |
+| Models | `opus`, `sonnet`, `haiku` |
 
-Важно: указывайте root URL `http://127.0.0.1:8787`, если клиент сам добавляет `/v1/messages`. Если конкретный UI просит полный endpoint, используйте `http://127.0.0.1:8787/v1/messages`.
+Важно: указывайте root URL `http://127.0.0.1:8787`, без `/v1`. Claude Desktop сам добавляет API paths вроде `/v1/messages`, `/v1/models` и `/v1/messages/count_tokens`. Полный endpoint `http://127.0.0.1:8787/v1/messages` нужен только если конкретный UI явно просит именно Messages endpoint.
 
 Если в `.env` задан `PROXY_API_KEY`, то в Claude Desktop нужно указать именно это значение. Proxy принимает его как `x-api-key` или `Authorization: Bearer`.
+
+7. Нажмите `Apply locally` / `Save`.
+8. Полностью перезапустите Claude Desktop.
 
 Рекомендуемый первый тест в Claude Desktop:
 
@@ -151,20 +182,35 @@ Discovery показывает только короткие aliases, но proxy
 | Параметр | Значение |
 | --- | --- |
 | Raw context window | `400000` |
-| Reserve | `32768` |
-| Advertised/enforced input budget | `367232` |
+| Advertised input budget for Claude Desktop | `367232` |
+| Hard input budget before trimming/error | `391808` |
+| Hard reserve | `8192` |
 | Output budget Opus/Sonnet | `8192` |
 | Output budget Haiku | `4096` |
 
-`/v1/messages/count_tokens` считает локальную приблизительную оценку. Она специально консервативна для русского/non-ASCII текста, tool schemas, tool results и image blocks. Это нужно, чтобы Claude Desktop начинал compaction раньше и не доводил upstream до отказа по контексту.
+Есть два разных входных лимита:
 
-Если входной запрос превышает бюджет, proxy вернет явную ошибку:
+- `CODEX_MAX_INPUT_TOKENS` - soft/advertised budget. Его видит Claude Desktop в `/v1/models`, чтобы заранее запускать compaction.
+- `CODEX_HARD_INPUT_TOKENS` - hard budget proxy перед отправкой в upstream. Он ближе к реальному окну `400000` и защищает от настоящего overflow.
+
+`/v1/messages/count_tokens` считает локальную приблизительную оценку. Она специально консервативна для русского/non-ASCII текста, tool schemas, tool results и image blocks. Это нужно, чтобы Claude Desktop начинал compaction раньше.
+
+Если Claude Desktop все равно отправил историю выше soft budget, proxy теперь не отвечает 400 сразу. Он принимает запрос до `CODEX_HARD_INPUT_TOKENS`.
+
+Если запрос превышает hard budget и `CONTEXT_OVERFLOW_STRATEGY=trim`, proxy удаляет самые старые сообщения, пока запрос не станет помещаться. При trimming:
+
+- сохраняется последний пользовательский контекст;
+- история не начинается с orphan `tool_result`;
+- в upstream `instructions` добавляется короткая заметка, что старые сообщения были удалены;
+- модель может потерять ранние детали, но чат не обрывается.
+
+Если даже после trimming запрос не помещается, proxy вернет:
 
 ```text
 Context window exceeded
 ```
 
-В этом случае начните новый чат или сделайте compaction/summary.
+В этом случае последний turn сам слишком большой или слишком тяжелые `tools`/images. Начните новый чат или сделайте compaction/summary.
 
 ## OpenAI Platform mode
 
@@ -252,11 +298,14 @@ curl -N http://127.0.0.1:8787/v1/messages \
 | `CLAUDE_*_REASONING_EFFORT` | reasoning effort по семействам |
 | `CLAUDE_*_TEXT_VERBOSITY` | verbosity по семействам |
 | `CODEX_CONTEXT_WINDOW_TOKENS` | raw upstream context window |
-| `CODEX_CONTEXT_RESERVE_TOKENS` | reserve под output и погрешность |
-| `CODEX_MAX_INPUT_TOKENS` | advertised/enforced input budget |
+| `CODEX_CONTEXT_RESERVE_TOKENS` | hard reserve под output и погрешность |
+| `CODEX_MAX_INPUT_TOKENS` | soft/advertised input budget для клиента |
+| `CODEX_HARD_INPUT_TOKENS` | hard budget перед trimming/error |
 | `CLAUDE_*_MAX_OUTPUT_TOKENS` | advertised output budget |
 | `TOKEN_ESTIMATE_MULTIPLIER` | safety multiplier для count_tokens |
 | `IMAGE_TOKEN_ESTIMATE` | оценка image block без размеров |
+| `CONTEXT_OVERFLOW_STRATEGY` | `trim` или `error` |
+| `CONTEXT_TRIM_NOTICE` | добавлять notice в instructions после trimming |
 | `MODEL_MAP` | exact overrides, например `claude-sonnet-4-6=gpt-5.4` |
 | `CODEX_AUTH_FILE` | путь к OAuth token file |
 | `CODEX_INSTRUCTIONS` | fallback instructions для Codex |
@@ -320,7 +369,14 @@ curl -s http://127.0.0.1:8787/v1/models/haiku
 
 ### `Context window exceeded`
 
-Это уже явный guard proxy. Начните новый чат или попросите Claude Desktop/клиент сжать историю.
+Это hard guard proxy. Сначала убедитесь, что сервер перезапущен и в `.env` есть:
+
+```dotenv
+CODEX_HARD_INPUT_TOKENS=391808
+CONTEXT_OVERFLOW_STRATEGY=trim
+```
+
+Если ошибка остается, значит последний запрос слишком большой даже после удаления старой истории. Начните новый чат или попросите Claude Desktop/клиент сжать историю.
 
 ### OAuth истек или upstream отвечает 401/403
 
@@ -351,6 +407,8 @@ curl -s http://127.0.0.1:8787/v1/models
 
 - Anthropic Messages API: https://docs.anthropic.com/en/api/messages
 - Anthropic streaming messages: https://docs.anthropic.com/en/api/messages-streaming
+- Claude Desktop local extensions and Developer settings: https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop
+- Claude Desktop remote vs desktop connectors: https://support.claude.com/en/articles/11725091-when-to-use-desktop-and-web-connectors
 - Claude plugins in Claude Desktop: https://support.claude.com/en/articles/13837440-use-plugins-in-claude
 - Claude Code plugins reference: https://code.claude.com/docs/en/plugins-reference
 - Claude Code plugin creation guide: https://code.claude.com/docs/en/plugins

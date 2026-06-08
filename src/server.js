@@ -9,6 +9,7 @@ import {
   resolveAnthropicFamily,
   resolveModelProfile,
   responsesToAnthropic,
+  trimAnthropicContext,
 } from "./anthropic.js";
 import { callUpstream } from "./upstream.js";
 import { encodeSse, parseResponsesSse, readSseEvents } from "./sse.js";
@@ -83,16 +84,48 @@ function estimateRequestInputTokens(body) {
   return estimateAnthropicTokens(body, config.tokenEstimate);
 }
 
-function assertContextBudget(body) {
+function contextTrimNotice(result) {
+  return (
+    `Context note: the local gateway removed ${result.removedMessages} older ` +
+    `message(s) because the request exceeded the upstream context budget. ` +
+    `Continue using the remaining conversation context and ask the user for missing details when needed.`
+  );
+}
+
+function prepareContextBody(body) {
   const inputTokens = estimateRequestInputTokens(body);
-  const maxInputTokens = config.limits.maxInputTokens;
-  if (inputTokens <= maxInputTokens) return inputTokens;
+  const hardInputTokens = config.limits.hardInputTokens;
+  if (inputTokens <= hardInputTokens) {
+    return {
+      body,
+      inputTokens,
+      originalTokens: inputTokens,
+      instructionsSuffix: "",
+      trimmed: false,
+    };
+  }
+
+  if (config.contextOverflow.strategy === "trim" && Array.isArray(body?.messages)) {
+    const trimmed = trimAnthropicContext(body, hardInputTokens, config.tokenEstimate);
+    if (!trimmed.exceeded) {
+      return {
+        body: trimmed.body,
+        inputTokens: trimmed.inputTokens,
+        originalTokens: trimmed.originalTokens,
+        instructionsSuffix: config.contextOverflow.trimNotice
+          ? contextTrimNotice(trimmed)
+          : "",
+        trimmed: trimmed.trimmed,
+        removedMessages: trimmed.removedMessages,
+      };
+    }
+  }
 
   throw new AnthropicError(
     400,
     "invalid_request_error",
     `Context window exceeded: estimated ${inputTokens} input tokens exceeds the configured ` +
-      `${maxInputTokens} token input budget. Start a new chat or compact the conversation.`,
+      `${hardInputTokens} token hard input budget. Start a new chat or compact the conversation.`,
   );
 }
 
@@ -102,9 +135,10 @@ async function handleMessages(req, res) {
   }
 
   const body = await readJson(req);
-  assertContextBudget(body);
-  const upstreamBody = anthropicToResponses(body, config, {
+  const prepared = prepareContextBody(body);
+  const upstreamBody = anthropicToResponses(prepared.body, config, {
     forceStream: config.upstream === "codex",
+    instructionsSuffix: prepared.instructionsSuffix,
   });
   const upstream = await callUpstream(config, upstreamBody);
 

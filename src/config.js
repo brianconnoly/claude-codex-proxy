@@ -163,6 +163,13 @@ function parsePositiveNumber(value, name) {
   return number;
 }
 
+function parseBoolean(value, name) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  throw new Error(`Invalid ${name}: ${value}`);
+}
+
 export function loadConfig() {
   loadDefaultEnvFile();
 
@@ -179,10 +186,15 @@ export function loadConfig() {
     "CODEX_CONTEXT_WINDOW_TOKENS",
   );
   const contextReserveTokens = parseNonNegativeInteger(
-    env("CODEX_CONTEXT_RESERVE_TOKENS", "32768"),
+    env("CODEX_CONTEXT_RESERVE_TOKENS", "8192"),
     "CODEX_CONTEXT_RESERVE_TOKENS",
   );
-  const defaultMaxInputTokens = Math.max(1, contextWindowTokens - contextReserveTokens);
+  const defaultHardInputTokens = Math.max(1, contextWindowTokens - contextReserveTokens);
+  const defaultMaxInputTokens = Math.max(1, contextWindowTokens - 32768);
+  const contextOverflowStrategy = env("CONTEXT_OVERFLOW_STRATEGY", "trim").toLowerCase();
+  if (contextOverflowStrategy !== "trim" && contextOverflowStrategy !== "error") {
+    throw new Error("CONTEXT_OVERFLOW_STRATEGY must be either trim or error");
+  }
 
   return {
     projectRoot,
@@ -205,6 +217,10 @@ export function loadConfig() {
       maxInputTokens: parsePositiveInteger(
         env("CODEX_MAX_INPUT_TOKENS", String(defaultMaxInputTokens)),
         "CODEX_MAX_INPUT_TOKENS",
+      ),
+      hardInputTokens: parsePositiveInteger(
+        env("CODEX_HARD_INPUT_TOKENS", String(defaultHardInputTokens)),
+        "CODEX_HARD_INPUT_TOKENS",
       ),
       opusMaxOutputTokens: parsePositiveInteger(
         env("CLAUDE_OPUS_MAX_OUTPUT_TOKENS", "8192"),
@@ -258,6 +274,10 @@ export function loadConfig() {
     tokenEstimate: {
       multiplier: parsePositiveNumber(env("TOKEN_ESTIMATE_MULTIPLIER", "1.15"), "TOKEN_ESTIMATE_MULTIPLIER"),
       imageTokens: parsePositiveInteger(env("IMAGE_TOKEN_ESTIMATE", "1024"), "IMAGE_TOKEN_ESTIMATE"),
+    },
+    contextOverflow: {
+      strategy: contextOverflowStrategy,
+      trimNotice: parseBoolean(env("CONTEXT_TRIM_NOTICE", "true"), "CONTEXT_TRIM_NOTICE"),
     },
   };
 }
