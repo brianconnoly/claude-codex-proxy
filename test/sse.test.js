@@ -65,6 +65,35 @@ test("reconstructs Responses SSE when final event is absent", async () => {
   ]);
 });
 
+test("keeps reconstructed text when final Responses SSE output is empty", async () => {
+  const response = sseResponse([
+    encodeSse("response.output_text.delta", {
+      type: "response.output_text.delta",
+      delta: "compact ",
+    }),
+    encodeSse("response.output_text.delta", {
+      type: "response.output_text.delta",
+      delta: "summary",
+    }),
+    encodeSse("response.completed", {
+      type: "response.completed",
+      response: {
+        id: "resp_2",
+        output: [],
+      },
+    }),
+  ]);
+
+  const result = await parseResponsesSse(response);
+  assert.equal(result.id, "resp_2");
+  assert.deepEqual(result.output, [
+    {
+      type: "message",
+      content: [{ type: "output_text", text: "compact summary" }],
+    },
+  ]);
+});
+
 test("throws on failed Responses SSE event", async () => {
   const response = sseResponse([
     encodeSse("response.failed", {

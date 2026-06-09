@@ -79,6 +79,9 @@ export async function parseResponsesSse(response) {
       if (json.type === "response.output_text.delta" && json.delta) {
         text += json.delta;
       }
+      if (json.type === "response.output_text.done" && json.text && !text) {
+        text = json.text;
+      }
       if (json.type === "response.output_item.added" && json.item?.type === "function_call") {
         upsertFunctionCall(json.item, json.output_index);
       }
@@ -113,8 +116,17 @@ export async function parseResponsesSse(response) {
     throw new Error(message);
   }
 
-  if (finalResponse) return finalResponse;
+  const output = reconstructedOutput(text, functionCalls);
+  if (finalResponse) {
+    return mergeReconstructedOutput(finalResponse, output);
+  }
 
+  if (output.length) return { output };
+
+  throw new Error(`No final response event found in upstream SSE: ${rawText.slice(0, 1000)}`);
+}
+
+function reconstructedOutput(text, functionCalls) {
   const output = [];
   if (text) {
     output.push({
@@ -126,8 +138,43 @@ export async function parseResponsesSse(response) {
   for (const call of new Set(functionCalls.values())) {
     output.push(call);
   }
+  return output;
+}
 
-  if (output.length) return { output };
+function outputHasText(output) {
+  return output.some((item) =>
+    item?.type === "message" &&
+    (item.content ?? []).some((part) =>
+      part?.type === "output_text" && (part.text ?? part.output_text),
+    ),
+  );
+}
 
-  throw new Error(`No final response event found in upstream SSE: ${rawText.slice(0, 1000)}`);
+function mergeReconstructedOutput(response, reconstructed) {
+  if (!reconstructed.length) return response;
+
+  const output = Array.isArray(response?.output) ? response.output.slice() : [];
+  const seenCalls = new Set(
+    output
+      .filter((item) => item?.type === "function_call")
+      .map((item) => item.call_id ?? item.id)
+      .filter(Boolean),
+  );
+  const hasText = outputHasText(output);
+
+  for (const item of reconstructed) {
+    if (item.type === "message") {
+      if (!hasText) output.push(item);
+      continue;
+    }
+
+    if (item.type === "function_call") {
+      const key = item.call_id ?? item.id;
+      if (key && seenCalls.has(key)) continue;
+      output.push(item);
+      if (key) seenCalls.add(key);
+    }
+  }
+
+  return { ...response, output };
 }

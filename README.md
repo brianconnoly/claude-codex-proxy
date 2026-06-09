@@ -133,7 +133,11 @@ zip -r anthropic-proxy-plugin.zip anthropic-proxy
 - `CONTEXT_COMPACT_MODEL`: cheap upstream model used for proxy-side summaries. Default: `gpt-5.4-mini`.
 - `CONTEXT_COMPACT_MAX_OUTPUT_TOKENS`: instruction-level summary output budget in Codex mode, hard Responses limit in OpenAI mode. Default: `2048`.
 - `CONTEXT_COMPACT_SUMMARY_TOKENS`: token budget reserved while deciding how much old history to summarize. Default: `2048`.
+- `CONTEXT_COMPACT_TRIGGER_TOKENS`: proactive proxy-side summary trigger, independent from the advertised `/v1/models` limit. Default: `260000`.
+- `CONTEXT_COMPACT_TARGET_TOKENS`: target size after proactive proxy-side summary. Default: `220000`.
 - `CONTEXT_COMPACT_CACHE_SIZE`: in-memory compact-summary cache entries. Default: `64`.
+- `PROMPT_CACHE_KEY_MODE`: `anthropic` derives an upstream `prompt_cache_key` from Anthropic `cache_control` markers; `off` disables this bridge. Default: `anthropic`.
+- `PROMPT_CACHE_RETENTION`: optional upstream prompt cache retention, empty, `in_memory`, or `24h`. Default: empty.
 - `MODEL_MAP`: comma-separated exact override map, for example `claude-sonnet-4-6=gpt-5.4,claude-opus-4-8=gpt-5.5`.
 - `CODEX_AUTH_FILE`: path for OAuth token storage.
 - `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`: official OpenAI Platform mode.
@@ -155,11 +159,13 @@ Implemented:
 - Claude family aliases: `opus`, `sonnet`, `haiku`, and model ids containing those family names
 - Non-streaming JSON responses
 - Streaming Anthropic SSE responses
+- Prompt cache key bridging from Anthropic `cache_control` markers and Anthropic-style cache usage reporting
+- `usage.input_tokens` reports the original full request estimate before proxy-side compact/trim
 
 Not implemented:
 
 - Anthropic-specific extended thinking fields
-- Prompt caching headers
+- Full parity with every Anthropic prompt caching beta/control field
 - Full parity with every Anthropic beta feature
 
 ## Notes

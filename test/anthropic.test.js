@@ -5,6 +5,7 @@ import {
   estimateAnthropicTokens,
   resolveAnthropicFamily,
   resolveModelProfile,
+  resolvePromptCacheKey,
   responsesToAnthropic,
   trimAnthropicContext,
 } from "../src/anthropic.js";
@@ -276,6 +277,56 @@ test("converts Anthropic none tool choice", () => {
   assert.equal(result.tool_choice, "none");
 });
 
+test("derives OpenAI prompt cache key from Anthropic cache_control prefix", () => {
+  const body = {
+    model: "sonnet",
+    system: [{ type: "text", text: "stable instructions", cache_control: { type: "ephemeral" } }],
+    messages: [
+      { role: "user", content: "first" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: "stable answer",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      },
+      { role: "user", content: "latest" },
+    ],
+  };
+  const cacheConfig = {
+    ...config,
+    promptCache: { keyMode: "anthropic", retention: "24h" },
+  };
+
+  const result = anthropicToResponses(body, cacheConfig);
+  const modelProfile = resolveModelProfile(body.model, cacheConfig);
+
+  assert.match(result.prompt_cache_key, /^anthropic:sonnet:[a-f0-9]{32}$/);
+  assert.equal(result.prompt_cache_key, resolvePromptCacheKey(body, cacheConfig, modelProfile));
+  assert.equal(result.prompt_cache_retention, "24h");
+});
+
+test("does not send prompt cache retention without a cache key", () => {
+  const cacheConfig = {
+    ...config,
+    promptCache: { keyMode: "anthropic", retention: "24h" },
+  };
+
+  const result = anthropicToResponses(
+    {
+      model: "sonnet",
+      messages: [{ role: "user", content: "hello" }],
+    },
+    cacheConfig,
+  );
+
+  assert.equal(result.prompt_cache_key, undefined);
+  assert.equal(result.prompt_cache_retention, undefined);
+});
+
 test("converts Responses output to Anthropic message", () => {
   const result = responsesToAnthropic(
     {
@@ -304,6 +355,66 @@ test("converts Responses output to Anthropic message", () => {
     { type: "tool_use", id: "call_2", name: "write", input: { path: "b" } },
   ]);
   assert.deepEqual(result.usage, { input_tokens: 10, output_tokens: 5 });
+});
+
+test("maps upstream cache usage details to Anthropic usage", () => {
+  const responsesResult = responsesToAnthropic(
+    {
+      usage: {
+        input_tokens: 100,
+        output_tokens: 5,
+        input_tokens_details: {
+          cached_tokens: 80,
+          cache_creation_tokens: 12,
+        },
+      },
+    },
+    "gpt-5.4",
+  );
+
+  assert.deepEqual(responsesResult.usage, {
+    input_tokens: 100,
+    output_tokens: 5,
+    cache_creation_input_tokens: 12,
+    cache_read_input_tokens: 80,
+  });
+
+  const chatCompletionsResult = responsesToAnthropic(
+    {
+      usage: {
+        prompt_tokens: 50,
+        completion_tokens: 4,
+        prompt_tokens_details: { cached_tokens: 25 },
+      },
+    },
+    "gpt-5.4",
+  );
+
+  assert.deepEqual(chatCompletionsResult.usage, {
+    input_tokens: 50,
+    output_tokens: 4,
+    cache_read_input_tokens: 25,
+  });
+});
+
+test("can report original pre-compaction input tokens in Anthropic usage", () => {
+  const result = responsesToAnthropic(
+    {
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        input_tokens_details: { cached_tokens: 4 },
+      },
+    },
+    "gpt-5.4",
+    { inputTokensOverride: 1234 },
+  );
+
+  assert.deepEqual(result.usage, {
+    input_tokens: 1234,
+    output_tokens: 5,
+    cache_read_input_tokens: 4,
+  });
 });
 
 test("estimates Anthropic count_tokens response locally", () => {

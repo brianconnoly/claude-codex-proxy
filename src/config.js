@@ -203,6 +203,20 @@ export function loadConfig() {
     env("CONTEXT_COMPACT_ENABLED", "true"),
     "CONTEXT_COMPACT_ENABLED",
   );
+  const defaultCompactTriggerTokens = Math.max(1, contextWindowTokens - 140000);
+  const defaultCompactTargetTokens = Math.max(1, contextWindowTokens - 180000);
+  const promptCacheKeyMode = env("PROMPT_CACHE_KEY_MODE", "anthropic").toLowerCase();
+  if (promptCacheKeyMode !== "off" && promptCacheKeyMode !== "anthropic") {
+    throw new Error("PROMPT_CACHE_KEY_MODE must be either off or anthropic");
+  }
+  const promptCacheRetention = env("PROMPT_CACHE_RETENTION");
+  if (
+    promptCacheRetention &&
+    promptCacheRetention !== "in_memory" &&
+    promptCacheRetention !== "24h"
+  ) {
+    throw new Error("PROMPT_CACHE_RETENTION must be empty, in_memory, or 24h");
+  }
 
   return {
     projectRoot,
@@ -283,6 +297,10 @@ export function loadConfig() {
       reasoningSummary,
       textVerbosity: env("TEXT_VERBOSITY", "low"),
     },
+    promptCache: {
+      keyMode: promptCacheKeyMode,
+      retention: promptCacheRetention,
+    },
     tokenEstimate: {
       multiplier: parsePositiveNumber(env("TOKEN_ESTIMATE_MULTIPLIER", "1.3"), "TOKEN_ESTIMATE_MULTIPLIER"),
       imageTokens: parsePositiveInteger(env("IMAGE_TOKEN_ESTIMATE", "1024"), "IMAGE_TOKEN_ESTIMATE"),
@@ -304,6 +322,14 @@ export function loadConfig() {
       summaryTokenBudget: parsePositiveInteger(
         env("CONTEXT_COMPACT_SUMMARY_TOKENS", "2048"),
         "CONTEXT_COMPACT_SUMMARY_TOKENS",
+      ),
+      triggerTokens: parsePositiveInteger(
+        env("CONTEXT_COMPACT_TRIGGER_TOKENS", String(defaultCompactTriggerTokens)),
+        "CONTEXT_COMPACT_TRIGGER_TOKENS",
+      ),
+      targetTokens: parsePositiveInteger(
+        env("CONTEXT_COMPACT_TARGET_TOKENS", String(defaultCompactTargetTokens)),
+        "CONTEXT_COMPACT_TARGET_TOKENS",
       ),
       cacheSize: parseNonNegativeInteger(
         env("CONTEXT_COMPACT_CACHE_SIZE", "64"),

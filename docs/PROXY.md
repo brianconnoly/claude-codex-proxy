@@ -190,6 +190,8 @@ Discovery показывает только короткие aliases, но proxy
 | Hard reserve | `40000` |
 | Proxy compact model | `gpt-5.4-mini` |
 | Proxy compact summary budget | `2048` |
+| Proxy compact trigger | `260000` |
+| Proxy compact target | `220000` |
 | Output budget Opus/Sonnet | `8192` |
 | Output budget Haiku | `4096` |
 
@@ -201,9 +203,11 @@ Discovery показывает только короткие aliases, но proxy
 
 `/v1/messages/count_tokens` считает локальную приблизительную оценку. Она специально консервативна для русского/non-ASCII текста, tool schemas, tool results и image blocks. Это нужно, чтобы Claude Desktop начинал compaction раньше.
 
-Важно: Claude Desktop может показывать `200k` в интерфейсе даже когда gateway discovery возвращает `max_input_tokens: 340000`. По публичной конфигурации Cowork on 3P есть обычная Claude-like модель и отдельный `supports1m` вариант, но нет документированного способа выставить произвольное GUI-окно вроде `340k`. Поэтому native compaction может сработать около `200k`; если Desktop все равно отправит больше, proxy-side compaction остается fallback.
+Важно: Claude Desktop может показывать `200k` в интерфейсе даже когда gateway discovery возвращает `max_input_tokens: 340000`. По публичной конфигурации Cowork on 3P есть обычная Claude-like модель и отдельный `supports1m` вариант, но нет документированного способа выставить произвольное GUI-окно вроде `340k`. Поэтому native compaction нельзя считать надежной частью gateway-протокола.
 
-Если Claude Desktop все равно отправил историю выше soft budget, proxy теперь не отвечает 400 сразу. Сначала он пытается сжать старый префикс истории отдельным дешевым запросом в `CONTEXT_COMPACT_MODEL` (`gpt-5.4-mini` по умолчанию), вставляет summary первым synthetic user message и сохраняет свежий хвост истории как raw messages.
+Proxy-side compaction теперь запускается раньше advertised window: при `CONTEXT_COMPACT_TRIGGER_TOKENS=260000` proxy пытается сжать старый префикс истории до `CONTEXT_COMPACT_TARGET_TOKENS=220000`. Это отдельная страховка от ситуации, где Claude Desktop дошел до 280k+ и не сделал native compact.
+
+Если Claude Desktop прислал историю выше compact trigger или soft budget, proxy не отвечает 400 сразу. Сначала он пытается сжать старый префикс истории отдельным дешевым запросом в `CONTEXT_COMPACT_MODEL` (`gpt-5.4-mini` по умолчанию), вставляет summary первым synthetic user message и сохраняет свежий хвост истории как raw messages.
 
 Claude Desktop этот compact не видит как native compaction: на следующем turn он снова пришлет свою локальную историю. Поэтому proxy кеширует summaries in-memory по fingerprint сжатого префикса (`CONTEXT_COMPACT_CACHE_SIZE`), чтобы не пересжимать один и тот же старый блок каждый раз.
 
@@ -323,10 +327,22 @@ curl -N http://127.0.0.1:8787/v1/messages \
 | `CONTEXT_COMPACT_MODEL` | модель для proxy-side summary |
 | `CONTEXT_COMPACT_MAX_OUTPUT_TOKENS` | output budget summary-запроса |
 | `CONTEXT_COMPACT_SUMMARY_TOKENS` | reserved summary budget при выборе префикса |
+| `CONTEXT_COMPACT_TRIGGER_TOKENS` | ранний trigger proxy-side summary |
+| `CONTEXT_COMPACT_TARGET_TOKENS` | target budget после proxy-side summary |
 | `CONTEXT_COMPACT_CACHE_SIZE` | размер in-memory cache для summaries |
+| `PROMPT_CACHE_KEY_MODE` | `anthropic` включает bridge из `cache_control` в upstream `prompt_cache_key`, `off` отключает |
+| `PROMPT_CACHE_RETENTION` | optional upstream retention: пусто, `in_memory`, или `24h` |
 | `MODEL_MAP` | exact overrides, например `claude-sonnet-4-6=gpt-5.4` |
 | `CODEX_AUTH_FILE` | путь к OAuth token file |
 | `CODEX_INSTRUCTIONS` | fallback instructions для Codex |
+
+## Prompt Caching
+
+Claude clients may send Anthropic `cache_control` markers on system/content/tool blocks. With `PROMPT_CACHE_KEY_MODE=anthropic`, the proxy canonicalizes the marked prefix, strips `cache_control` from the upstream payload, and sends a deterministic OpenAI/Codex `prompt_cache_key`.
+
+If the upstream rejects `prompt_cache_key` or `prompt_cache_retention`, the proxy retries the same request once without prompt cache parameters. When upstream usage includes cached-token details, the Anthropic response usage includes `cache_read_input_tokens` and, if available, `cache_creation_input_tokens`. Non-zero cache usage is also logged by the proxy.
+
+`usage.input_tokens` is reported as the original full request estimate before proxy-side compact/trim. This keeps Claude-facing usage aligned with the context volume Claude sent, while `output_tokens`, `cache_read_input_tokens`, and `cache_creation_input_tokens` still come from the final upstream response after any proxy-side compaction.
 
 ## Troubleshooting
 
@@ -399,6 +415,8 @@ CONTEXT_COMPACT_ENABLED=true
 CONTEXT_COMPACT_MODEL=gpt-5.4-mini
 CONTEXT_COMPACT_MAX_OUTPUT_TOKENS=2048
 CONTEXT_COMPACT_SUMMARY_TOKENS=2048
+CONTEXT_COMPACT_TRIGGER_TOKENS=260000
+CONTEXT_COMPACT_TARGET_TOKENS=220000
 ```
 
 Если ошибка остается после перезапуска, значит последний запрос слишком большой даже после compaction/trimming или upstream отклоняет модель с меньшим фактическим окном. Временно уменьшите `CODEX_MAX_INPUT_TOKENS` и `CODEX_RETRY_INPUT_TOKENS`, затем перезапустите proxy.

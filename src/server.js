@@ -102,6 +102,12 @@ function isContextWindowError(message) {
   );
 }
 
+function isUnsupportedPromptCacheError(message) {
+  return /unsupported parameter: prompt_cache_|unknown parameter.*prompt_cache_|unrecognized.*prompt_cache_/i.test(
+    String(message ?? ""),
+  );
+}
+
 function estimateRequestInputTokens(body) {
   return estimateAnthropicTokens(body, config.tokenEstimate);
 }
@@ -293,12 +299,25 @@ async function prepareContextBody(body, options = {}) {
   const inputTokens = estimateRequestInputTokens(body);
   const targetInputTokens = options.targetInputTokens ?? config.limits.maxInputTokens;
   const hardInputTokens = config.limits.hardInputTokens;
+  const compactTriggerTokens = Math.min(
+    targetInputTokens,
+    options.compactTriggerTokens ?? config.contextCompact.triggerTokens,
+  );
+  const compactTargetTokens = Math.min(
+    targetInputTokens,
+    options.compactTargetTokens ?? config.contextCompact.targetTokens,
+  );
+  const shouldCompact =
+    config.contextOverflow.strategy === "trim" &&
+    config.contextCompact.enabled &&
+    Array.isArray(body?.messages) &&
+    (inputTokens > compactTriggerTokens || options.forceTrim);
   const shouldTrim =
     config.contextOverflow.strategy === "trim" &&
     Array.isArray(body?.messages) &&
     (inputTokens > targetInputTokens || options.forceTrim);
 
-  if (!shouldTrim && inputTokens <= hardInputTokens) {
+  if (!shouldCompact && !shouldTrim && inputTokens <= hardInputTokens) {
     return {
       body,
       inputTokens,
@@ -308,9 +327,18 @@ async function prepareContextBody(body, options = {}) {
     };
   }
 
-  if (shouldTrim) {
-    const compacted = await tryCompactContextBody(body, targetInputTokens, options);
-    if (compacted) return compacted;
+  if (shouldCompact) {
+    const compacted = await tryCompactContextBody(body, compactTargetTokens, {
+      ...options,
+      reason: options.reason ?? `the request exceeded the local compact trigger of ${compactTriggerTokens} estimated input tokens`,
+    });
+    if (compacted) {
+      console.warn(
+        `Context compacted: ${compacted.originalTokens} -> ${compacted.inputTokens} estimated ` +
+          `input tokens, summarized ${compacted.removedMessages} message(s)`,
+      );
+      return compacted;
+    }
   }
 
   if (shouldTrim) {
@@ -355,9 +383,30 @@ async function callPreparedUpstream(body, prepareOptions = {}) {
   const upstreamBody = anthropicToResponses(prepared.body, config, {
     forceStream: config.upstream === "codex",
     instructionsSuffix: prepared.instructionsSuffix,
+    disablePromptCache: Boolean(prepareOptions.disablePromptCache),
   });
   const upstream = await callUpstream(config, upstreamBody);
   return { prepared, upstreamBody, upstream };
+}
+
+function logPromptCacheUsage(usage = {}) {
+  const created = usage.cache_creation_input_tokens ?? 0;
+  const read = usage.cache_read_input_tokens ?? 0;
+  if (!created && !read) return;
+  console.info(`Prompt cache usage: read ${read} cached input token(s), created ${created} input token(s)`);
+}
+
+function streamDeltaUsage(usage = {}) {
+  const result = { output_tokens: usage.output_tokens ?? 0 };
+  for (const key of ["cache_creation_input_tokens", "cache_read_input_tokens"]) {
+    if (Object.hasOwn(usage, key)) result[key] = usage[key];
+  }
+  return result;
+}
+
+function originalInputTokens(prepared) {
+  const tokens = Number(prepared?.originalTokens);
+  return Number.isFinite(tokens) ? Math.max(0, Math.trunc(tokens)) : null;
 }
 
 async function handleMessages(req, res) {
@@ -366,19 +415,30 @@ async function handleMessages(req, res) {
   }
 
   const body = await readJson(req);
-  let { upstreamBody, upstream } = await callPreparedUpstream(body);
+  let promptCacheDisabled = false;
+  let { prepared, upstreamBody, upstream } = await callPreparedUpstream(body);
   let retriedContext = false;
 
   if (!upstream.ok) {
-    const error = await readUpstreamError(upstream);
-    if (isContextWindowError(error.message) && config.contextOverflow.strategy === "trim") {
+    let error = await readUpstreamError(upstream);
+    if (isUnsupportedPromptCacheError(error.message)) {
+      promptCacheDisabled = true;
+      console.warn(`Prompt cache parameters rejected by upstream, retrying without them: ${error.message}`);
+      ({ prepared, upstreamBody, upstream } = await callPreparedUpstream(body, {
+        disablePromptCache: true,
+      }));
+      error = upstream.ok ? null : await readUpstreamError(upstream);
+    }
+
+    if (error && isContextWindowError(error.message) && config.contextOverflow.strategy === "trim") {
       retriedContext = true;
-      ({ upstreamBody, upstream } = await callPreparedUpstream(body, {
+      ({ prepared, upstreamBody, upstream } = await callPreparedUpstream(body, {
         targetInputTokens: config.limits.retryInputTokens,
         forceTrim: true,
         reason: "the upstream rejected the first attempt as too large for its context window",
+        disablePromptCache: promptCacheDisabled,
       }));
-    } else {
+    } else if (error) {
       throw upstreamErrorToAnthropicError(error);
     }
   }
@@ -388,7 +448,9 @@ async function handleMessages(req, res) {
   }
 
   if (body.stream) {
-    await streamAnthropic(upstream, res, body.model ?? upstreamBody.model);
+    await streamAnthropic(upstream, res, body.model ?? upstreamBody.model, {
+      inputTokensOverride: originalInputTokens(prepared),
+    });
     return;
   }
 
@@ -406,10 +468,11 @@ async function handleMessages(req, res) {
       config.contextOverflow.strategy === "trim"
     ) {
       retriedContext = true;
-      ({ upstreamBody, upstream } = await callPreparedUpstream(body, {
+      ({ prepared, upstreamBody, upstream } = await callPreparedUpstream(body, {
         targetInputTokens: config.limits.retryInputTokens,
         forceTrim: true,
         reason: "the upstream rejected the first attempt as too large for its context window",
+        disablePromptCache: promptCacheDisabled,
       }));
       if (!upstream.ok) throw await upstreamErrorToAnthropic(upstream);
       const retryContentType = upstream.headers.get("content-type") ?? "";
@@ -421,7 +484,11 @@ async function handleMessages(req, res) {
     }
   }
 
-  sendJson(res, 200, responsesToAnthropic(responsesBody, body.model ?? upstreamBody.model), {
+  const anthropicBody = responsesToAnthropic(responsesBody, body.model ?? upstreamBody.model, {
+    inputTokensOverride: originalInputTokens(prepared),
+  });
+  logPromptCacheUsage(anthropicBody.usage);
+  sendJson(res, 200, anthropicBody, {
     "request-id": crypto.randomUUID(),
   });
 }
@@ -447,13 +514,14 @@ function responseFailureMessage(json) {
   );
 }
 
-async function streamAnthropic(upstream, res, model) {
+async function streamAnthropic(upstream, res, model, options = {}) {
   const messageId = `msg_${crypto.randomUUID()}`;
   let contentIndex = -1;
   let textOpen = false;
   let completed = null;
   let upstreamFailure = null;
   const toolBlocks = new Map();
+  const inputTokensOverride = originalInputTokens({ originalTokens: options.inputTokensOverride });
 
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -531,7 +599,7 @@ async function streamAnthropic(upstream, res, model) {
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
+      usage: { input_tokens: inputTokensOverride ?? 0, output_tokens: 0 },
     },
   });
 
@@ -619,16 +687,17 @@ async function streamAnthropic(upstream, res, model) {
     return;
   }
 
-  const anthropicFinal = responsesToAnthropic(completed ?? {}, model);
+  const anthropicFinal = responsesToAnthropic(completed ?? {}, model, {
+    inputTokensOverride,
+  });
+  logPromptCacheUsage(anthropicFinal.usage);
   send("message_delta", {
     type: "message_delta",
     delta: {
       stop_reason: anthropicFinal.stop_reason,
       stop_sequence: null,
     },
-    usage: {
-      output_tokens: anthropicFinal.usage.output_tokens,
-    },
+    usage: streamDeltaUsage(anthropicFinal.usage),
   });
   send("message_stop", { type: "message_stop" });
   res.end();

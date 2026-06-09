@@ -314,6 +314,8 @@ export function anthropicToResponses(body, config, options = {}) {
     );
   }
 
+  applyPromptCache(upstreamBody, body, config, modelProfile, options);
+
   return upstreamBody;
 }
 
@@ -323,6 +325,104 @@ function safeJsonParse(value, fallback = {}) {
     return JSON.parse(value);
   } catch {
     return fallback;
+  }
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== "object") return value;
+
+  const result = {};
+  for (const key of Object.keys(value).sort()) {
+    if (key === "cache_control") continue;
+    result[key] = canonicalize(value[key]);
+  }
+  return result;
+}
+
+function stableJson(value) {
+  return JSON.stringify(canonicalize(value));
+}
+
+function hasCacheControl(value) {
+  return Boolean(value?.cache_control && typeof value.cache_control === "object");
+}
+
+function asCacheableSystemBlocks(system) {
+  if (system == null) return [];
+  if (typeof system === "string") return [{ type: "text", text: system }];
+  return asArray(system);
+}
+
+function anthropicCachePrefix(body, modelProfile) {
+  const prefix = {
+    upstream_model: modelProfile.model,
+    requested_model: body?.model,
+    tools: [],
+    system: [],
+    messages: [],
+  };
+  let snapshot = null;
+
+  const mark = () => {
+    snapshot = JSON.parse(stableJson(prefix));
+  };
+
+  for (const tool of body?.tools ?? []) {
+    prefix.tools.push(canonicalize(tool));
+    if (hasCacheControl(tool)) mark();
+  }
+
+  for (const block of asCacheableSystemBlocks(body?.system)) {
+    prefix.system.push(canonicalize(block));
+    if (hasCacheControl(block)) mark();
+  }
+
+  for (const message of body?.messages ?? []) {
+    if (!message || typeof message !== "object") continue;
+    const cachedMessage = {
+      role: message.role,
+      content: [],
+    };
+    prefix.messages.push(cachedMessage);
+
+    if (typeof message.content === "string") {
+      cachedMessage.content.push(message.content);
+    } else {
+      for (const block of asArray(message.content)) {
+        cachedMessage.content.push(canonicalize(block));
+        if (hasCacheControl(block)) mark();
+      }
+    }
+
+    if (hasCacheControl(message)) mark();
+  }
+
+  if (hasCacheControl(body)) mark();
+  return snapshot;
+}
+
+export function resolvePromptCacheKey(body, config, modelProfile) {
+  if (config.promptCache?.keyMode !== "anthropic") return null;
+
+  const prefix = anthropicCachePrefix(body, modelProfile);
+  if (!prefix) return null;
+
+  return `anthropic:${modelProfile.family ?? "model"}:${crypto
+    .createHash("sha256")
+    .update(stableJson(prefix))
+    .digest("hex")
+    .slice(0, 32)}`;
+}
+
+function applyPromptCache(upstreamBody, body, config, modelProfile, options) {
+  if (options.disablePromptCache) return;
+
+  const key = resolvePromptCacheKey(body, config, modelProfile);
+  if (!key) return;
+  upstreamBody.prompt_cache_key = key;
+  if (config.promptCache?.retention) {
+    upstreamBody.prompt_cache_retention = config.promptCache.retention;
   }
 }
 
@@ -358,7 +458,51 @@ function mapStopReason(response, content) {
   return "end_turn";
 }
 
-export function responsesToAnthropic(response, model) {
+function firstFiniteToken(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number)) return Math.max(0, Math.trunc(number));
+  }
+  return null;
+}
+
+function responseUsageToAnthropic(usage = {}, options = {}) {
+  const inputTokens = firstFiniteToken(
+    options.inputTokensOverride,
+    usage.input_tokens,
+    usage.prompt_tokens,
+  ) ?? 0;
+  const outputTokens = firstFiniteToken(usage.output_tokens, usage.completion_tokens) ?? 0;
+  const result = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+  };
+
+  const cacheCreationTokens = firstFiniteToken(
+    usage.cache_creation_input_tokens,
+    usage.input_tokens_details?.cache_creation_input_tokens,
+    usage.input_tokens_details?.cache_creation_tokens,
+    usage.prompt_tokens_details?.cache_creation_input_tokens,
+    usage.prompt_tokens_details?.cache_creation_tokens,
+  );
+  if (cacheCreationTokens != null) {
+    result.cache_creation_input_tokens = cacheCreationTokens;
+  }
+
+  const cacheReadTokens = firstFiniteToken(
+    usage.cache_read_input_tokens,
+    usage.input_tokens_details?.cached_tokens,
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.cached_tokens,
+  );
+  if (cacheReadTokens != null) {
+    result.cache_read_input_tokens = cacheReadTokens;
+  }
+
+  return result;
+}
+
+export function responsesToAnthropic(response, model, options = {}) {
   const content = extractOutput(response);
   return {
     id: response?.id ?? `msg_${crypto.randomUUID()}`,
@@ -368,10 +512,7 @@ export function responsesToAnthropic(response, model) {
     content,
     stop_reason: mapStopReason(response, content),
     stop_sequence: null,
-    usage: {
-      input_tokens: response?.usage?.input_tokens ?? 0,
-      output_tokens: response?.usage?.output_tokens ?? 0,
-    },
+    usage: responseUsageToAnthropic(response?.usage, options),
   };
 }
 
